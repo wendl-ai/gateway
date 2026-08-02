@@ -1,0 +1,8 @@
+# secrets & runtime data — NEVER commit
+.env
+.env.local
+.env.*.local
+data/
+*.log
+
+node_modules/
