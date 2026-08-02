@@ -4,7 +4,19 @@
 // idempotently, then print a copy-paste block to point nanoclaw at it. Budgets come
 // from TEAM_MONTHLY_BUDGET / OPS_MONTHLY_BUDGET (env).
 
+import fs from 'fs';
+import path from 'path';
+import url from 'url';
 import { ensureKey, DATA_DIR } from './lib/store.mjs';
+
+const HERE = path.dirname(url.fileURLToPath(import.meta.url));
+// Same code runs inside the wendl.ai monorepo (repo-root Makefile one level up)
+// and in the standalone wendl-ai/gateway release (no Makefile) — point at
+// whichever commands actually work in this checkout.
+const STANDALONE = !fs.existsSync(path.join(HERE, '..', 'Makefile'));
+const runGateway = STANDALONE ? 'npm start' : 'make gateway';
+const rotateKey = (alias) => STANDALONE ? `node rotate.mjs ${alias}` : `make rotate-key ALIAS=${alias}`;
+const keysPath = STANDALONE ? 'data/keys.json' : 'gateway/data/keys.json';
 
 const teamBudget = Number(process.env.TEAM_MONTHLY_BUDGET || 50);
 const opsBudget = Number(process.env.OPS_MONTHLY_BUDGET || 5);
@@ -20,13 +32,13 @@ p(`  team ($${teamBudget}/30d):  ${team}`);
 p(`  ops  ($${opsBudget}/30d):  ${ops}`);
 p(`  store: ${DATA_DIR}`);
 p('  ⚠ treat these like passwords — budget-capped, but anyone who can reach the gateway can spend to the cap.');
-p('    They also live in gateway/data/keys.json (gitignored). Leaked one? `make rotate-key ALIAS=team` kills it.');
+p(`    They also live in ${keysPath} (gitignored). Leaked one? \`${rotateKey('team')}\` kills it.`);
 
 if (!process.env.LITELLM_MASTER_KEY) {
-  p('\n⚠  Set LITELLM_MASTER_KEY in .env before `make gateway` (any long random string).');
+  p(`\n⚠  Set LITELLM_MASTER_KEY in .env before \`${runGateway}\` (any long random string).`);
 }
 p('\nStart the gateway (no Docker):');
-p('  make gateway                         # serves :' + port);
+p(`  ${runGateway}                         # serves :${port}`);
 
 p('\nPoint nanoclaw at it — drop-in, Anthropic Messages format. Team agent:');
 p(`  ANTHROPIC_BASE_URL=${base}`);
