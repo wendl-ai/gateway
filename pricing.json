@@ -1,0 +1,9 @@
+{
+  "_comment": "USD per 1,000,000 tokens. in = input/prompt, out = output/completion. Cloud prices are refreshed from OpenRouter's first-party catalog via `make refresh-pricing` (mapping in model-map.json); re-run it before quoting a customer. Local models are $0 (compute is yours) and are never touched by the refresh.",
+  "claude-opus-4-8": { "in": 5, "out": 25 },
+  "claude-sonnet-5": { "in": 2, "out": 10 },
+  "claude-haiku-4-5-20251001": { "in": 1, "out": 5 },
+  "llama3.1:8b": { "in": 0, "out": 0 },
+  "llama3.2:1b": { "in": 0, "out": 0 },
+  "qwen2.5:7b-instruct": { "in": 0, "out": 0 }
+}

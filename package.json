@@ -1,0 +1,16 @@
+{
+  "name": "wendl-gateway",
+  "version": "1.0.0",
+  "description": "Wendl gateway — routing, virtual keys, and spend/budget caps. Drop-in for the LiteLLM proxy, zero deps, no Docker.",
+  "private": false,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "bootstrap": "node bootstrap.mjs",
+    "start": "node server.mjs",
+    "test": "node test/smoke.mjs"
+  }
+}

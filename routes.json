@@ -1,0 +1,15 @@
+{
+  "_comment": "Wendl gateway routing — mirrors litellm/config.yaml so the gateway is a drop-in. `tiers` maps tier names to concrete model ids (same as evals/configs.json); `providers` gives upstream bases. Env overrides: OLLAMA_BASE, OPENROUTER_BASE, ANTHROPIC_BASE, OPENROUTER_API_KEY, ANTHROPIC_API_KEY.",
+  "tiers": {
+    "tier-local-small": "llama3.1:8b",
+    "tier-local-medium": "llama3.1:8b",
+    "tier-cheap": "claude-haiku-4-5-20251001",
+    "tier-mid": "claude-sonnet-5",
+    "tier-deep": "claude-opus-4-8"
+  },
+  "providers": {
+    "ollama": { "base": "http://localhost:11434/v1", "format": "openai" },
+    "openrouter": { "base": "https://openrouter.ai/api/v1", "format": "openai" },
+    "anthropic": { "base": "https://api.anthropic.com", "format": "anthropic" }
+  }
+}
