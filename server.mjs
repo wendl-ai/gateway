@@ -72,16 +72,20 @@ async function handleInference(req, res, kind) {
 
   const one = kind === 'messages' ? messages : chat;
   const streamer = kind === 'messages' ? messagesStream : chatStream;
+  // Forward the client's own anthropic-beta opt-in on the native passthrough
+  // path — otherwise a beta-gated body field (e.g. the Agent SDK's
+  // context_management) reaches Anthropic with no opt-in and gets rejected.
+  const beta = req.headers['anthropic-beta'];
   const t0 = Date.now();
   let attempt = 0, lastErr;
   while (attempt <= RETRIES) {
     try {
       if (body.stream === true) {
-        const { usage } = await streamer(route, body, res);
+        const { usage } = await streamer(route, body, res, undefined, beta);
         finalizeSpend(route, usage, a.key, 200, Date.now() - t0);
         return; // response already written/ended by the streamer
       }
-      const { status, json, usage } = await one(route, body);
+      const { status, json, usage } = await one(route, body, undefined, beta);
       finalizeSpend(route, usage, a.key, status, Date.now() - t0);
       return send(res, status, json);
     } catch (e) {
