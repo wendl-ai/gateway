@@ -147,6 +147,47 @@ async function main() {
   // 15. auth: no key rejected
   assert((await gw('/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status === 401, 'missing key -> 401');
 
+  // ---- attribution + /spend/activity (the spaces recap input) ----
+  // Tag calls with a space/agent the way a harness would, then roll them up.
+  const tagged = (space, text, agent = 'researcher') => ({
+    method: 'POST',
+    headers: { ...AUTH, 'content-type': 'application/json', 'x-wendl-space': space, 'x-wendl-agent': agent, 'x-wendl-actor': 'dan' },
+    body: JSON.stringify({ model: 'llama3.1:8b', messages: [{ role: 'user', content: text }] }),
+  });
+  const t0 = Date.now();
+  await gw('/v1/chat/completions', tagged('project-x', 'what is the schema'));
+  await gw('/v1/chat/completions', tagged('project-x', 'What is   the schema')); // same question, different whitespace/case
+  await gw('/v1/chat/completions', tagged('project-x', 'something else entirely'));
+  await gw('/v1/chat/completions', tagged('other-space', 'unrelated'));
+
+  // 16. the log carries attribution, and untagged rows are unchanged
+  const logs2 = await (await gw('/spend/logs', { headers: AUTH })).json();
+  const px = logs2.filter((l) => l.space === 'project-x');
+  assert(px.length === 3, 'tagged calls carry x-wendl-space into the spend log');
+  assert(px.every((l) => l.agent === 'researcher' && l.actor === 'dan'), 'agent + actor tags are recorded');
+  assert(px.every((l) => l.prompt_sig && !JSON.stringify(l).includes('schema')), 'prompt is stored as a hash — no prompt text lands in the spend log');
+  assert(logs2.some((l) => !('space' in l)), 'untagged calls still log with no attribution keys at all');
+
+  // 17. rollup for one space
+  const act = await (await gw('/spend/activity?space=project-x', { headers: AUTH })).json();
+  assert(act.runs === 3, `/spend/activity scopes to the space (${act.runs} runs)`);
+  assert(act.agents.some((a) => a.agent === 'researcher' && a.runs === 3), 'rollup buckets by agent');
+  assert(act.tokens.in === 300 && act.tokens.out === 60, 'rollup sums tokens');
+
+  // 18. repeat detection — the most useful line in an agent cost breakdown
+  assert(act.repeats.inGroups === 2 && act.repeats.redundant === 1, 'normalized-identical prompts are detected as a repeat');
+  assert((await (await gw('/spend/activity?space=other-space', { headers: AUTH })).json()).runs === 1, 'a different space sees only its own calls');
+
+  // 19. time window + auth
+  assert((await (await gw(`/spend/activity?space=project-x&since=${t0 - 1}`, { headers: AUTH })).json()).runs === 3, 'since= includes calls after the watermark');
+  assert((await (await gw(`/spend/activity?space=project-x&since=${Date.now() + 60000}`, { headers: AUTH })).json()).runs === 0, 'a future watermark yields an empty window');
+  assert((await gw('/spend/activity', { headers: { Authorization: `Bearer ${rot.key}` } })).status === 401, '/spend/activity is admin-only');
+
+  // 20. the rollup is self-describing — a consumer needs no other call
+  assert(act.space === 'project-x' && act.cost === 0 && act.errors === 0, 'rollup echoes its own scope and totals');
+  const all = await (await gw('/spend/activity', { headers: AUTH })).json();
+  assert(all.space === null && all.runs > act.runs, 'no space filter rolls up everything');
+
   console.log(`\nALL ${passed} CHECKS PASSED`);
   upstream.close(); process.exit(0);
 }

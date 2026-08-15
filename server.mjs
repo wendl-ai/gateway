@@ -9,6 +9,7 @@
 //   POST /v1/messages           Anthropic-compatible (nanoclaw / Claude Agent SDK)
 //   GET  /spend/logs            per-call token+cost log      (plugin /stats)
 //   GET  /spend/keys            per-virtual-key spend/budget (plugin /limits)
+//   GET  /spend/activity        per-space rollup for a window (spaces recap)
 //   POST /key/generate          mint a budgeted virtual key  (OpenClaw)
 //   GET  /v1/models             minimal model listing
 //   GET  /health                liveness
@@ -16,6 +17,7 @@
 //   node gateway/server.mjs        # or: make gateway   (after: make bootstrap-lite)
 
 import http from 'http';
+import crypto from 'crypto';
 import { resolveRoute, knownModels } from './lib/router.mjs';
 import { chat, chatStream, messages, messagesStream } from './lib/providers.mjs';
 import { costOf } from './lib/pricing.mjs';
@@ -43,6 +45,40 @@ const readBody = (req) => new Promise((resolve, reject) => {
   req.on('end', () => { try { resolve(d ? JSON.parse(d) : {}); } catch (e) { reject(e); } });
   req.on('error', reject);
 });
+
+// --- attribution -------------------------------------------------------------
+// Spend answers "who paid" (the virtual key). A caller that wants to report on a
+// container of work — a channel, a project, a space — needs "for what", so a client
+// can tag each call with where it came from. Headers, not body fields: out-of-band
+// means the upstream payload is untouched and the same tags work for both the OpenAI
+// and Anthropic shapes. Every field is optional — an untagged call logs exactly as
+// it did before, with no attribution keys at all.
+const TAG = /[\x00-\x1f\x7f]/g;
+const tag = (req, name) => String(req.headers[name] || '').replace(TAG, '').trim().slice(0, 64) || null;
+const attribution = (req) => ({
+  space: tag(req, 'x-wendl-space'),   // the container this belongs to (#project-x)
+  thread: tag(req, 'x-wendl-thread'), // finer grain within it, if the client has one
+  actor: tag(req, 'x-wendl-actor'),   // the human who triggered it
+  agent: tag(req, 'x-wendl-agent'),   // which agent ran
+});
+
+const textOf = (content) => {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map((b) => (typeof b === 'string' ? b : b?.text || '')).join(' ');
+  return '';
+};
+
+// A hash of the last user message, so a report can say "9 of 14 runs were the same
+// question" — the single most useful line in an agent cost breakdown. Deliberately
+// a HASH: the spend log stays free of prompt content, which is a property worth
+// keeping (it's the difference between a meter and a transcript store).
+function promptSig(body) {
+  const msgs = Array.isArray(body?.messages) ? body.messages : [];
+  const last = [...msgs].reverse().find((m) => m?.role === 'user');
+  const text = textOf(last?.content).toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 12);
+}
 
 // master key authorizes everything; a virtual key authorizes only chat (and is billed)
 function auth(req, { adminOnly } = {}) {
@@ -76,42 +112,48 @@ async function handleInference(req, res, kind) {
   // path — otherwise a beta-gated body field (e.g. the Agent SDK's
   // context_management) reaches Anthropic with no opt-in and gets rejected.
   const beta = req.headers['anthropic-beta'];
+  const meta = { ...attribution(req), prompt_sig: promptSig(body) };
   const t0 = Date.now();
   let attempt = 0, lastErr;
   while (attempt <= RETRIES) {
     try {
       if (body.stream === true) {
         const { usage } = await streamer(route, body, res, undefined, beta);
-        finalizeSpend(route, usage, a.key, 200, Date.now() - t0);
+        finalizeSpend(route, usage, a.key, 200, Date.now() - t0, meta);
         return; // response already written/ended by the streamer
       }
       const { status, json, usage } = await one(route, body, undefined, beta);
-      finalizeSpend(route, usage, a.key, status, Date.now() - t0);
+      finalizeSpend(route, usage, a.key, status, Date.now() - t0, meta);
       return send(res, status, json);
     } catch (e) {
       lastErr = e; attempt++;
       if (attempt > RETRIES) break;
     }
   }
-  finalizeSpend(route, { prompt_tokens: 0, completion_tokens: 0 }, a.key, 502, Date.now() - t0, 'error');
+  finalizeSpend(route, { prompt_tokens: 0, completion_tokens: 0 }, a.key, 502, Date.now() - t0, meta, 'error');
   return err(res, 502, `upstream call failed after ${RETRIES + 1} attempts: ${lastErr?.message || lastErr}`, 'api_error');
 }
 
-function finalizeSpend(route, usage, key, status, latencyMs, statusLabel) {
+function finalizeSpend(route, usage, key, status, latencyMs, meta = {}, statusLabel) {
   const inTok = usage?.prompt_tokens || 0, outTok = usage?.completion_tokens || 0;
   const spend = costOf(route.costModel, inTok, outTok);
+  // Drop empty attribution rather than writing nulls — keeps untagged rows byte-identical
+  // to what the log held before, so old data and new data read the same.
+  const tags = Object.fromEntries(Object.entries(meta).filter(([, v]) => v));
   store.record({
     key, key_alias: key ? (store.getKey(key)?.key_alias || null) : 'master',
     model: route.costModel, provider: route.provider,
     prompt_tokens: inTok, completion_tokens: outTok,
     spend: spend || 0, priced: spend != null,
     status: statusLabel || (status >= 400 ? 'error' : 'ok'), latency_ms: Math.round(latencyMs),
+    ...tags,
   });
 }
 
 const server = http.createServer(async (req, res) => {
   try {
-    const { pathname } = new URL(req.url, 'http://localhost');
+    const u = new URL(req.url, 'http://localhost');
+    const { pathname } = u;
     if (req.method === 'GET' && pathname === '/health') return send(res, 200, { status: 'ok', service: 'wendl-gateway' });
 
     if (req.method === 'POST' && pathname === '/v1/chat/completions') return handleInference(req, res, 'chat');
@@ -128,6 +170,19 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && pathname === '/spend/keys') {
       if (!auth(req, { adminOnly: true }).ok) return err(res, 401, 'admin key required', 'authentication_error');
       return send(res, 200, store.listKeys());
+    }
+    // What a space/channel spent in a window, and how much of it was the same
+    // question twice. Admin-only, matching its /spend/* siblings.
+    if (req.method === 'GET' && pathname === '/spend/activity') {
+      if (!auth(req, { adminOnly: true }).ok) return err(res, 401, 'admin key required', 'authentication_error');
+      const q = u.searchParams;
+      const num = (name) => (q.get(name) ? Number(q.get(name)) : undefined);
+      return send(res, 200, store.readActivity({
+        space: q.get('space') || undefined,
+        thread: q.get('thread') || undefined,
+        since: num('since') || 0,
+        until: num('until'),
+      }));
     }
     if (req.method === 'POST' && pathname === '/key/generate') {
       if (!auth(req, { adminOnly: true }).ok) return err(res, 401, 'admin key required', 'authentication_error');
