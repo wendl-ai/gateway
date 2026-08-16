@@ -18,6 +18,10 @@ process.env.LITELLM_MASTER_KEY = 'test-master';
 process.env.WENDL_GATEWAY_PORT = String(GW);
 process.env.WENDL_GATEWAY_DATA = DATA;
 process.env.WENDL_GATEWAY_RETRIES = '1';
+// Repeat brake on, with a small limit so the tests can trip it deliberately. It's
+// off by default in production; see lib/brake.mjs.
+process.env.WENDL_REPEAT_LIMIT = '3';
+process.env.WENDL_REPEAT_WINDOW_MS = '60000';
 process.env.OLLAMA_BASE = `http://127.0.0.1:${UP}/v1`;
 process.env.OPENROUTER_BASE = `http://127.0.0.1:${UP}/v1`;
 process.env.ANTHROPIC_BASE = `http://127.0.0.1:${UP}`;
@@ -187,6 +191,57 @@ async function main() {
   assert(act.space === 'project-x' && act.cost === 0 && act.errors === 0, 'rollup echoes its own scope and totals');
   const all = await (await gw('/spend/activity', { headers: AUTH })).json();
   assert(all.space === null && all.runs > act.runs, 'no space filter rolls up everything');
+
+  // ---- the repeat brake (lib/brake.mjs) ----
+  // The failure it exists for: many agents in one space converging on one question.
+  // WENDL_REPEAT_LIMIT is 3 above, so calls 1-3 run and 4+ are refused.
+  const swarm = (text, agent) => gw('/v1/chat/completions', tagged('swarm', text, agent));
+
+  // 21. under the limit, a shared question is just work
+  for (const agent of ['scout-a', 'scout-b', 'scout-c']) {
+    assert((await swarm('poll the job queue', agent)).status === 200, `identical prompt from ${agent} runs while under the limit`);
+  }
+
+  // 22. over it, the loop is refused — with its own error type, not the budget's
+  const blocked = await swarm('poll the job queue', 'scout-d');
+  const blockedBody = await blocked.json();
+  assert(blocked.status === 429, 'the 4th identical call in the window is declined');
+  assert(blockedBody.error?.type === 'repeat_limit', 'decline is typed repeat_limit, distinct from budget_exceeded');
+  assert(/already ran 3×/.test(blockedBody.error.message), `decline says how many already ran ("${blockedBody.error.message.slice(0, 48)}…")`);
+
+  // 23. THE property that makes this different from a budget cap: it stops the
+  //     looping question, not the space. Everyone else keeps working.
+  assert((await swarm('summarize the findings', 'scout-e')).status === 200, 'a different question in the same space still runs');
+  assert((await gw('/v1/chat/completions', tagged('other-swarm', 'poll the job queue'))).status === 200, 'the same question in a different space still runs');
+
+  // 24. an ignored 429 must not turn a token runaway into a disk runaway
+  const before25 = (await (await gw('/spend/logs', { headers: AUTH })).json()).filter((l) => l.status === 'declined').length;
+  const later = await (await swarm('poll the job queue', 'scout-f')).json();
+  await swarm('poll the job queue', 'scout-g');
+  // The count in the message is RUNS, not attempts: attempts keep climbing while
+  // the brake holds, but nothing past the limit ever reached a model or a bill.
+  assert(/already ran 3×/.test(later.error.message), `a later refusal still reports 3 runs, not 4 ("${later.error.message.slice(14, 46)}…")`);
+  const after25 = (await (await gw('/spend/logs', { headers: AUTH })).json()).filter((l) => l.status === 'declined').length;
+  assert(before25 === 1 && after25 === 1, 'further refusals are counted in memory, not appended to the spend log');
+
+  // 25. declined calls are not runs: no model, no tokens, no cost
+  const sw = await (await gw('/spend/activity?space=swarm', { headers: AUTH })).json();
+  assert(sw.runs === 4 && sw.brakeTrips === 1, `rollup separates 4 runs from 1 stopped question (got ${sw.runs}/${sw.brakeTrips})`);
+  assert(sw.agents.every((a) => a.agent !== 'scout-d'), 'a declined call never reaches the agent bucket');
+  assert(sw.repeats.redundant === 2, 'repeats counts only the redundancy that actually ran');
+
+  // 26. live view — the question the spend log cannot answer mid-incident
+  const live = await (await gw('/spend/brake', { headers: AUTH })).json();
+  assert(live.enabled === true && live.limit === 3, '/spend/brake echoes its configuration');
+  const trip = live.tripped.find((t) => t.scope === 'swarm');
+  assert(trip && trip.attempts === 6 && trip.declined === 3, `live counts every refusal (${trip?.attempts} attempts, ${trip?.declined} declined)`);
+  assert((await gw('/spend/brake', { headers: { Authorization: `Bearer ${rot.key}` } })).status === 401, '/spend/brake is admin-only');
+
+  // 27. evals must not break: untagged master traffic asks one question N times
+  //     across N models on purpose, so it is exempt by design.
+  for (let i = 0; i < 5; i++) {
+    assert((await gw('/v1/chat/completions', chatBody('llama3.1:8b'))).status === 200, `untagged master call ${i + 1} is exempt from the brake`);
+  }
 
   console.log(`\nALL ${passed} CHECKS PASSED`);
   upstream.close(); process.exit(0);

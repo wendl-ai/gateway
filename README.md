@@ -32,6 +32,7 @@ npm test                 # end-to-end smoke test (fake upstream, no real keys)
 | `GET /spend/logs`          | per-call token + cost log                   |
 | `GET /spend/keys`          | per-virtual-key spend vs budget             |
 | `GET /spend/activity`      | rollup for a space/thread over a window     |
+| `GET /spend/brake`         | what the repeat brake is blocking right now |
 | `POST /key/generate`       | mint a budgeted virtual key                 |
 | `POST /key/rotate`         | kill a key + mint a new one (same budget)   |
 | `GET /v1/models`           | minimal model listing                       |
@@ -63,7 +64,7 @@ curl -s -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
 ```
 
 ```json
-{ "space": "project-x", "runs": 14, "cost": 2.1, "errors": 0,
+{ "space": "project-x", "runs": 14, "cost": 2.1, "errors": 0, "brakeTrips": 1,
   "tokens": { "in": 120400, "out": 8210 },
   "models": [{ "model": "claude-sonnet-5", "runs": 11, "cost": 2.1 }],
   "agents": [{ "agent": "researcher", "runs": 14, "cost": 2.1 }],
@@ -77,6 +78,48 @@ a meter and a transcript store.
 
 Not included: *files touched*. This sees model calls, not tool calls — that would need
 a proxy at the agent-protocol layer, which is out of scope here.
+
+## The repeat brake
+
+A budget cap is a brake on **money**: it notices after the money is gone, and when it
+trips it stops the whole space. The repeat brake is a brake on **structure** — it
+notices one question being asked over and over and stops only that loop. Both are
+cheap, so the gateway runs both.
+
+```bash
+WENDL_REPEAT_LIMIT=5          # identical calls allowed per window, per scope. 0 = off
+WENDL_REPEAT_WINDOW_MS=60000  # the window (default 60s)
+```
+
+**Off by default.** It refuses calls that would otherwise be served, so switching it
+on should be a deliberate act rather than something a `git pull` does to a running
+system. Over the limit, the caller gets a `429` typed `repeat_limit` (distinct from
+`budget_exceeded`) explaining what looped and when it clears.
+
+**Scope** is the `x-wendl-space` tag when the caller sets one — that's the swarm case,
+many agents converging on one question — and otherwise the virtual key, which is the
+single-agent loop. **Untagged master-key traffic is exempt by design:** that's evals
+and setup, where running one prompt N times across N models is the point, not a fault.
+
+Two properties worth knowing before you turn it on:
+
+- **It stops the question, not the space.** Every other agent, and every other question
+  from the same agent, keeps working. That is the whole difference from a dollar cap.
+- **The spend log gets one row per trip, not one per refusal.** A client that ignores
+  the `429` and keeps hammering must not be able to turn a token runaway into a disk
+  runaway. So `brakeTrips` in the rollup counts *runaway questions*; for live
+  per-refusal counts during an incident, use `GET /spend/brake`.
+
+```json
+{ "enabled": true, "limit": 5, "window_ms": 60000,
+  "tripped": [{ "scope": "project-x", "prompt_sig": "9f2c1a7b4e08",
+                "attempts": 412, "declined": 407, "resets_in_ms": 21400 }] }
+```
+
+**What it can and cannot see.** Grouping is on a hash of the prompt, so this catches
+convergent *asking*. It does not catch convergent *doing* — thirty agents writing the
+same file from thirty differently-worded prompts are thirty distinct calls from in
+here. The distinction is worth stating rather than blurring.
 
 ## Routing
 

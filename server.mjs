@@ -10,6 +10,7 @@
 //   GET  /spend/logs            per-call token+cost log      (plugin /stats)
 //   GET  /spend/keys            per-virtual-key spend/budget (plugin /limits)
 //   GET  /spend/activity        per-space rollup for a window (spaces recap)
+//   GET  /spend/brake           what the repeat brake is blocking right now
 //   POST /key/generate          mint a budgeted virtual key  (OpenClaw)
 //   GET  /v1/models             minimal model listing
 //   GET  /health                liveness
@@ -22,6 +23,7 @@ import { resolveRoute, knownModels } from './lib/router.mjs';
 import { chat, chatStream, messages, messagesStream } from './lib/providers.mjs';
 import { costOf } from './lib/pricing.mjs';
 import * as store from './lib/store.mjs';
+import * as brake from './lib/brake.mjs';
 
 const PORT = Number(process.env.WENDL_GATEWAY_PORT || 4000);
 // Loopback by default — same-box agents reach it, nothing is exposed off-box.
@@ -106,13 +108,30 @@ async function handleInference(req, res, kind) {
     return err(res, 429, `budget exceeded for key '${rec.key_alias || a.key.slice(0, 12)}' ($${rec.spend.toFixed(4)} / $${rec.max_budget})`, 'budget_exceeded');
   }
 
+  const meta = { ...attribution(req), prompt_sig: promptSig(body) };
+
+  // The second brake (see lib/brake.mjs). The budget cap above stops spending;
+  // this stops looping, which the cap only catches later and more bluntly.
+  //
+  // Scope is the SPACE when the caller tags one — that's the swarm case, many
+  // agents converging on one question — and otherwise the virtual key, which is
+  // the single-agent loop. Untagged master-key traffic is deliberately exempt:
+  // that's evals and setup, where running one prompt N times across N models is
+  // the entire point and a repeat cap would break the backtest.
+  const gate = brake.check(meta.space || a.key, meta.prompt_sig);
+  if (!gate.ok) {
+    // One log row per trip, not one per refusal — a client that ignores the 429
+    // and keeps hammering must not convert a token runaway into a disk runaway.
+    if (gate.firstTrip) finalizeSpend(route, null, a.key, 429, 0, meta, 'declined');
+    return err(res, 429, brake.declineMessage(gate), 'repeat_limit');
+  }
+
   const one = kind === 'messages' ? messages : chat;
   const streamer = kind === 'messages' ? messagesStream : chatStream;
   // Forward the client's own anthropic-beta opt-in on the native passthrough
   // path — otherwise a beta-gated body field (e.g. the Agent SDK's
   // context_management) reaches Anthropic with no opt-in and gets rejected.
   const beta = req.headers['anthropic-beta'];
-  const meta = { ...attribution(req), prompt_sig: promptSig(body) };
   const t0 = Date.now();
   let attempt = 0, lastErr;
   while (attempt <= RETRIES) {
@@ -183,6 +202,13 @@ const server = http.createServer(async (req, res) => {
         since: num('since') || 0,
         until: num('until'),
       }));
+    }
+    // What the repeat brake is holding down right now. The spend log records one
+    // row per trip, so it can't answer "is something looping at this moment" —
+    // this can, and that's the question you have during an incident.
+    if (req.method === 'GET' && pathname === '/spend/brake') {
+      if (!auth(req, { adminOnly: true }).ok) return err(res, 401, 'admin key required', 'authentication_error');
+      return send(res, 200, brake.live());
     }
     if (req.method === 'POST' && pathname === '/key/generate') {
       if (!auth(req, { adminOnly: true }).ok) return err(res, 401, 'admin key required', 'authentication_error');
